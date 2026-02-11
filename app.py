@@ -64,7 +64,7 @@ def get_data_and_signal():
             if 'Close' in df.columns: df[col] = df['Close']
             else: return None, None, None
 
-    # --- 2. 計算指標 (關鍵修正：移除未來函數) ---
+    # --- 2. 計算指標 (關鍵修正：移除未來函數 & 修復 NaN) ---
     # 日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
@@ -80,7 +80,8 @@ def get_data_and_signal():
     weekly_ma_shifted = weekly_ma.shift(1)
     
     # 步驟 B: 將「上週的均線」填滿到「本週的每一天」
-    df['MA200_W'] = weekly_ma_shifted.reindex(df.index, method='ffill')
+    # 使用 ffill() 確保如果今天是週二，它能抓到上週五的值，而不是 nan
+    df['MA200_W'] = weekly_ma_shifted.reindex(df.index).ffill()
 
     # --- 3. 策略回測 ---
     df['Action'] = None 
@@ -131,8 +132,7 @@ def get_data_and_signal():
                 
                 # 價格模擬: 
                 # 您的案例: 4/7收160, 4/8跌到142.3, 均線在152.82
-                # 4/8 當天開盤可能在 158 (假設)，盤中殺到 142.3
-                # 程式會在價格穿過 152.82 時成交。
+                # 程式會判定在 4/8 當天觸發買進。
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
