@@ -64,31 +64,23 @@ def get_data_and_signal():
             if 'Close' in df.columns: df[col] = df['Close']
             else: return None, None, None
 
-    # --- 2. 計算指標 (使用 merge_asof 解決對齊問題) ---
+    # --- 2. 計算指標 (使用 merge_asof + 補值) ---
     
     # A. 計算日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
     # B. 獨立計算週 K 200
-    # Resample 到每週五 (W-FRI)
     weekly = df['Close'].resample('W-FRI').last().to_frame(name='Weekly_Close')
     weekly['MA200_W'] = weekly['Weekly_Close'].rolling(window=200).mean()
     
-    # ★★★ 關鍵技術：merge_asof ★★★
-    # 這是處理不同時間頻率最精準的方法。
-    # 它會幫每一天的日線資料，去找到「在這個日期之前」最近的一筆週線資料。
-    # 這完美實現了「本週的交易，參考的是上一週結算的均線」。
-    
-    # 1. 確保 index 都是 datetime 並且排序好
+    # 確保 index 排序
     df = df.sort_index()
     weekly = weekly.sort_index()
     
-    # 2. 將週線資料 shift(1) -> 因為我們要用「上一週」的均線
-    # 這樣週二看到的，就會是上週五算出來的那個值
+    # 關鍵：使用上一週的均線 (Shift 1)
     weekly['Ref_MA200_W'] = weekly['MA200_W'].shift(1)
     
-    # 3. 合併！
-    # direction='backward' 意思是：往回找最近的一個有效值
+    # 合併
     df_merged = pd.merge_asof(
         df, 
         weekly[['Ref_MA200_W']], 
@@ -97,11 +89,12 @@ def get_data_and_signal():
         direction='backward'
     )
     
-    # 把合併進來的欄位改名回我們習慣的 MA200_W
     df_merged = df_merged.rename(columns={'Ref_MA200_W': 'MA200_W'})
     
-    # 如果最前面有缺值 (因為週線需要很久才算得出來)，用後面的值回填一下避免報錯
-    # 但主要回測區間 (2016後) 應該都已經有值了
+    # ★★★ 修復顯示問題：強制填補最後的空值 ★★★
+    # 如果最後一天剛好沒對到，就沿用前一天的數值
+    df_merged['MA200_W'] = df_merged['MA200_W'].ffill()
+    
     df = df_merged
 
     # --- 3. 策略回測 ---
@@ -138,11 +131,9 @@ def get_data_and_signal():
         is_below_3days = all(days_check < ma_check)
         
         # --- 判斷觸價 ---
-        # 如果 MA200_W 是 nan，代表歷史資料不足，跳過
         if pd.isna(ma_w):
             is_touch_weekly = False
         else:
-            # 邏輯：今天盤中最低價 <= 「上週五」的週均線
             is_touch_weekly = low <= (ma_w * tolerance)
         
         action = None
@@ -154,7 +145,6 @@ def get_data_and_signal():
                 holding = True
                 action = "Buy_B"
                 
-                # 價格模擬
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
@@ -309,12 +299,12 @@ if st.button('🔄 點擊更新最新數據'):
                 last_close = df['Close'].iloc[-1]
                 last_ma_d = df['MA200_D'].iloc[-1]
                 
-                # 這裡處理頂部卡片的顯示
-                # 即使是最新的一天，因為使用了 merge_asof，它一定找得到上一週的均線
-                if 'MA200_W' in df.columns and not pd.isna(df['MA200_W'].iloc[-1]):
-                    last_ma_w = df['MA200_W'].iloc[-1]
+                # ★★★ 顯示修復：強制抓取最後一個有效的數值 (避免 nan) ★★★
+                # 我們用 ffill().iloc[-1] 來確保就算最後一格是 nan，也會顯示前一格的值
+                try:
+                    last_ma_w = df['MA200_W'].ffill().iloc[-1]
                     ma_w_display = f"{last_ma_w:.2f}"
-                else:
+                except:
                     ma_w_display = "計算中..."
                 
                 st.header(f"📅 數據日期: {last_dt}")
