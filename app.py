@@ -18,6 +18,10 @@ st.sidebar.info("""
 
 **🔴 賣出訊號:**
 連續 3 日收盤 < 日 K 200 均線
+
+**表格說明:**
+相同顏色的兩行為同一個交易循環
+(買進 + 賣出)。
 """)
 
 # --- 核心邏輯函數 ---
@@ -30,37 +34,28 @@ def get_data_and_signal():
     if df.empty:
         return None, None, None
 
-    # --- 關鍵修正 1: 強制移除時區 (解決 nan 問題) ---
-    df.index = df.index.tz_localize(None)
-
-    # --- 關鍵修正 2: 處理欄位格式 ---
+    # --- 資料格式修正 ---
+    df.index = df.index.tz_localize(None) # 移除時區
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
         df = df.rename(columns={'Adj Close': 'Close'})
-    
-    # 確保有 Low，沒有就用 Close 代替
     if 'Low' not in df.columns:
         df['Low'] = df['Close']
 
     # --- 計算指標 ---
-    # 1. 日 K 200 均
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
-    # 2. 週 K 200 均 (修正算法)
-    # 先轉成週線，算完 MA，再填回日線
     weekly = df['Close'].resample('W').last()
     weekly_ma = weekly.rolling(window=200).mean()
-    # 使用 ffill 將週線數值填入該週的每一天
     df['MA200_W'] = weekly_ma.reindex(df.index, method='ffill')
 
     # --- 策略回測邏輯 ---
     df['Action'] = None 
     holding = False
-    history = [] # 紀錄所有交易
+    history = [] 
     
-    # 從有均線數據後開始算
     start_calc = 0
     for i in range(len(df)):
         if not pd.isna(df['MA200_D'].iloc[i]) and not pd.isna(df['MA200_W'].iloc[i]):
@@ -76,11 +71,8 @@ def get_data_and_signal():
         ma_d = df['MA200_D'].iloc[i]
         ma_w = df['MA200_W'].iloc[i]
         
-        # 確保有前兩天資料
         if i < 2: continue
 
-        # 訊號判斷
-        # 連續 3 天 (包含今天 i, 昨天 i-1, 前天 i-2)
         days_check = df['Close'].iloc[i-2:i+1]
         ma_check = df['MA200_D'].iloc[i-2:i+1]
         
@@ -89,42 +81,115 @@ def get_data_and_signal():
         is_touch_weekly = low <= ma_w
         
         action = None
+        date_str = curr_idx.strftime('%Y-%m-%d')
         
         if not holding:
-            # 買進優先級：抄底 > 順勢
             if is_touch_weekly:
                 holding = True
                 action = "Buy_B"
-                history.append({
-                    'Date': curr_idx.strftime('%Y-%m-%d'), 
-                    'Type': '🔵 買進 (抄底)', 
-                    'Price': close,
-                    'Note': f'跌破週均 {ma_w:.1f}'
-                })
+                history.append({'Date': date_str, 'Type': '🔵 買進 (抄底)', 'Price': close, 'RawType': 'Buy'})
             elif is_above_3days:
                 holding = True
                 action = "Buy_A"
-                history.append({
-                    'Date': curr_idx.strftime('%Y-%m-%d'), 
-                    'Type': '🟢 買進 (順勢)', 
-                    'Price': close,
-                    'Note': f'站上日均 {ma_d:.1f}'
-                })
+                history.append({'Date': date_str, 'Type': '🟢 買進 (順勢)', 'Price': close, 'RawType': 'Buy'})
         else:
             if is_below_3days:
                 holding = False
                 action = "Sell"
-                history.append({
-                    'Date': curr_idx.strftime('%Y-%m-%d'), 
-                    'Type': '🔴 賣出', 
-                    'Price': close,
-                    'Note': f'跌破日均 {ma_d:.1f}'
-                })
+                history.append({'Date': date_str, 'Type': '🔴 賣出', 'Price': close, 'RawType': 'Sell'})
         
         signals[i] = action
 
     df['Action'] = signals
     return df, history, holding
+
+# --- 處理表格資料的函數 (14格邏輯) ---
+def process_history_table(history, is_holding):
+    # 我們需要顯示 14 格 (7 個循環)
+    # 邏輯：最新的在最上面
+    
+    display_rows = []
+    
+    # 複製一份歷史紀錄並反轉 (最新的在前面)
+    rev_history = history[::-1]
+    
+    # 1. 處理當前狀態 (第一格)
+    if not is_holding:
+        # 如果空手，第一格是空白的 "等待訊號"
+        display_rows.append({
+            '交易日期': '---', 
+            '動作': '⚪ 等待買進訊號...', 
+            '價格': '---', 
+            'Group': 0 # Group 0 代表第一格空白
+        })
+        data_idx = 0
+    else:
+        # 如果持倉中，第一格是當前的買進單
+        # 在 rev_history 中，最新的應該是 Buy
+        if rev_history and rev_history[0]['RawType'] == 'Buy':
+            latest = rev_history[0]
+            display_rows.append({
+                '交易日期': latest['Date'],
+                '動作': latest['Type'],
+                '價格': f"{latest['Price']:.2f}",
+                'Group': 1 # Group 1 開始代表第一組循環
+            })
+            data_idx = 1 # 已經用掉一筆資料
+        else:
+            # 異常防呆
+            data_idx = 0
+
+    # 2. 填滿剩下的格子 (總共要湊滿 14 格)
+    # 我們用 Group ID 來控制顏色，每兩筆資料(一買一賣)為一組
+    
+    current_group = 1 if is_holding else 1
+    
+    # 從 data_idx 開始遍歷歷史資料
+    while len(display_rows) < 14:
+        if data_idx < len(rev_history):
+            item = rev_history[data_idx]
+            
+            # 決定 Group ID: 
+            # 賣出單(Sell) 和 下一筆買進單(Buy) 應該是同一組
+            # 因為 rev_history 是倒序，所以是先看到 Sell，再看到 Buy
+            
+            row_data = {
+                '交易日期': item['Date'],
+                '動作': item['Type'],
+                '價格': f"{item['Price']:.2f}",
+                'Group': current_group
+            }
+            display_rows.append(row_data)
+            
+            # 如果這筆是 Buy，代表這組循環結束(在倒序中)，換下一組顏色
+            if item['RawType'] == 'Buy':
+                current_group += 1
+            
+            data_idx += 1
+        else:
+            # 如果歷史資料不夠 14 筆，填空值
+            display_rows.append({
+                '交易日期': '', '動作': '', '價格': '', 'Group': -1
+            })
+            
+    return pd.DataFrame(display_rows)
+
+# --- 表格顏色設定 ---
+def highlight_groups(row):
+    group = row['Group']
+    
+    if group == 0: # 等待買進
+        return ['background-color: #ffffff; color: #888888'] * len(row)
+    elif group == -1: # 資料不足的空格
+        return ['background-color: #f0f2f6'] * len(row)
+    
+    # 循環顏色 (深淺交替)
+    if group % 2 != 0:
+        # 奇數組 (例如 Group 1, 3, 5...) - 淺藍色背景
+        return ['background-color: #e3f2fd; color: black'] * len(row)
+    else:
+        # 偶數組 (例如 Group 2, 4, 6...) - 淺灰色/白色背景
+        return ['background-color: #ffffff; color: black'] * len(row)
 
 # --- 主程式執行 ---
 if st.button('🔄 點擊更新最新數據'):
@@ -133,80 +198,55 @@ if st.button('🔄 點擊更新最新數據'):
             df, history, is_holding = get_data_and_signal()
             
             if df is not None:
-                # --- 1. 頂部狀態卡片 ---
+                # --- 頂部資訊 ---
                 last_dt = df.index[-1].strftime('%Y-%m-%d')
                 last_close = df['Close'].iloc[-1]
                 last_ma_d = df['MA200_D'].iloc[-1]
                 last_ma_w = df['MA200_W'].iloc[-1]
                 
                 st.header(f"📅 數據日期: {last_dt}")
-                
-                # 顯示關鍵價格
                 c1, c2, c3 = st.columns(3)
                 c1.metric("目前股價", f"{last_close:.2f}")
-                c2.metric("日 K 200 (多空線)", f"{last_ma_d:.2f}")
-                c3.metric("週 K 200 (抄底線)", f"{last_ma_w:.2f}")
+                c2.metric("日 K 200", f"{last_ma_d:.2f}")
+                c3.metric("週 K 200", f"{last_ma_w:.2f}")
 
-                # 顯示持倉狀態與今日訊號
                 st.markdown("---")
+                
+                # --- 狀態警示 ---
                 today_act = df['Action'].iloc[-1]
-                
-                # 狀態判斷
-                if is_holding:
-                    st.markdown(f"### 🚩 目前狀態: :green[持倉中 (HOLDING)]")
-                    # 尋找這筆單的買入資訊
-                    last_buy = None
-                    for rec in reversed(history):
-                        if "買進" in rec['Type']:
-                            last_buy = rec
-                            break
-                    if last_buy:
-                         st.info(f"💰 **本輪持倉成本**: {last_buy['Date']} 以 **{last_buy['Price']:.2f}** 元買進")
-                else:
-                    st.markdown(f"### 🚩 目前狀態: :gray[空手觀望 (EMPTY)]")
-                
-                # 警示訊號
                 if today_act == "Buy_B":
                     st.error("🚨 **觸發訊號**: 嚴重超跌，立即買進抄底！")
                 elif today_act == "Buy_A":
                     st.success("✅ **觸發訊號**: 趨勢確認，進場買進！")
                 elif today_act == "Sell":
                     st.warning("⚠️ **觸發訊號**: 趨勢反轉，獲利/停損出場！")
-                else:
-                    st.caption("🍵 今日無交易訊號，維持現狀。")
 
-                # --- 2. 交易紀錄表格 (您要求的功能) ---
-                st.markdown("---")
-                c_chart, c_hist = st.columns([2, 1])
+                # --- 版面分割: 左邊表格(14格)，右邊圖表 ---
+                col_table, col_chart = st.columns([1, 2])
                 
-                with c_hist:
-                    st.subheader("📋 最近交易紀錄")
-                    if history:
-                        # 只取最後 5 筆，反轉順序讓最新的在上面
-                        recent_hist = history[-5:][::-1]
-                        hist_df = pd.DataFrame(recent_hist)
-                        # 美化表格顯示
-                        st.table(hist_df[['Date', 'Type', 'Price']])
-                    else:
-                        st.write("尚無交易紀錄 (可能是資料長度不足以產生訊號)")
+                with col_table:
+                    st.subheader("📋 交易循環紀錄 (14格)")
+                    # 處理表格資料
+                    table_df = process_history_table(history, is_holding)
+                    # 應用顏色樣式 (隱藏 Group 欄位)
+                    styled_df = table_df.style.apply(highlight_groups, axis=1).hide(axis='index')
+                    # 顯示表格
+                    st.dataframe(styled_df, use_container_width=True, height=520, column_config={"Group": None})
 
-                with c_chart:
+                with col_chart:
                     st.subheader("📈 策略走勢圖")
                     fig = go.Figure()
-                    # 股價與均線
                     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='收盤價', line=dict(color='#2962FF', width=1.5)))
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA200_D'], mode='lines', name='日K200', line=dict(color='#FF6D00', width=1)))
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA200_W'], mode='lines', name='週K200', line=dict(color='#D50000', width=2, dash='dash')))
                     
-                    # 買賣點標記
                     buys = df[df['Action'].str.contains('Buy', na=False)]
                     sells = df[df['Action'] == 'Sell']
                     
                     fig.add_trace(go.Scatter(x=buys.index, y=buys['Close'], mode='markers', name='買進', marker=dict(color='green', size=12, symbol='triangle-up')))
                     fig.add_trace(go.Scatter(x=sells.index, y=sells['Close'], mode='markers', name='賣出', marker=dict(color='red', size=12, symbol='triangle-down')))
                     
-                    # 設定圖表版面
-                    fig.update_layout(height=450, margin=dict(l=20, r=20, t=30, b=20), legend=dict(orientation="h", y=1, x=0))
+                    fig.update_layout(height=500, margin=dict(l=20, r=20, t=30, b=20), legend=dict(orientation="h", y=1, x=0))
                     st.plotly_chart(fig, use_container_width=True)
 
             else:
