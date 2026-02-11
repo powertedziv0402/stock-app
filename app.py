@@ -24,21 +24,33 @@ st.sidebar.info("""
 @st.cache_data(ttl=3600)
 def get_data_and_signal():
     ticker = "00631L.TW"
-    # 強制修正：加入 auto_adjust=False 以確保資料格式穩定
+    # 使用 auto_adjust=False 確保抓到原始 Close
     df = yf.download(ticker, period="10y", progress=False, auto_adjust=False)
     
     if df.empty:
         return None, None, None
 
-    # --- 關鍵修正：處理多層索引 (KeyError 修復) ---
-    # 無論抓下來的格式長怎樣，我們強制只取「最後一層」的欄位名稱 (Close, Open...)
+    # --- 🔧 絕對修正：處理 yfinance 資料格式問題 ---
+    # 如果是多層索引 (MultiIndex)，強制把欄位扁平化
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(-1)
+        # 新版 yfinance 回傳格式通常是 (Price, Ticker)，我們要取第 0 層 (Price)
+        df.columns = df.columns.get_level_values(0)
     
-    # 有時候欄位會帶有 Ticker 名稱，確保乾淨
-    df = df.rename(columns={"Close": "Close", "Low": "Low"})
+    # 再次確認：如果有 'Adj Close' 但沒有 'Close'，就改名
+    if 'Close' not in df.columns and 'Adj Close' in df.columns:
+        df = df.rename(columns={'Adj Close': 'Close'})
+        
+    # 如果還是沒有 Close，回報錯誤
+    if 'Close' not in df.columns:
+        st.error(f"資料欄位異常，抓到的欄位有：{df.columns.tolist()}")
+        return None, None, None
 
-    # 計算指標
+    # 確保 Low 欄位也存在
+    if 'Low' not in df.columns:
+        # 如果只有 Close，就暫時用 Close 代替 Low (極端狀況)
+        df['Low'] = df['Close']
+
+    # --- 計算指標 ---
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
     # 計算週均線並映射回日線
@@ -47,14 +59,17 @@ def get_data_and_signal():
     df['MA200_W'] = df_weekly['MA200_W'].reindex(df.index, method='ffill')
 
     # --- 策略回測邏輯 ---
-    df['Signal'] = 'Wait'
-    df['Action_Price'] = None
+    df['Action'] = None # 初始化
     
     holding = False
     history = []
     
-    start_calc = 250 
-    signals = []
+    # 為了效能，只運算最後 2000 天
+    calc_len = min(2000, len(df))
+    start_calc = len(df) - calc_len
+    if start_calc < 250: start_calc = 250 # 確保有足夠均線資料
+    
+    signals = [None] * start_calc # 前面的填空
     
     for i in range(start_calc, len(df)):
         curr_idx = df.index[i]
@@ -63,6 +78,11 @@ def get_data_and_signal():
         ma_d = df['MA200_D'].iloc[i]
         ma_w = df['MA200_W'].iloc[i]
         
+        # 安全檢查：如果有 NaN 就跳過
+        if pd.isna(ma_d) or pd.isna(ma_w):
+            signals.append(None)
+            continue
+
         # 判斷變數
         is_above_3days = all(df['Close'].iloc[i-2:i+1] > df['MA200_D'].iloc[i-2:i+1])
         is_touch_weekly = low <= ma_w
@@ -87,7 +107,6 @@ def get_data_and_signal():
         
         signals.append(action)
 
-    df = df.iloc[start_calc:].copy()
     df['Action'] = signals
     
     return df, history, holding
@@ -131,6 +150,7 @@ if st.button('🔄 更新最新數據與訊號'):
                 fig.add_trace(go.Scatter(x=df.index, y=df['MA200_D'], mode='lines', name='日K200均', line=dict(color='orange', width=1)))
                 fig.add_trace(go.Scatter(x=df.index, y=df['MA200_W'], mode='lines', name='週K200均', line=dict(color='red', width=2, dash='dash')))
                 
+                # 過濾出有動作的點
                 buys = df[df['Action'].str.contains('Buy', na=False)]
                 sells = df[df['Action'] == 'Sell']
                 
@@ -145,7 +165,5 @@ if st.button('🔄 更新最新數據與訊號'):
                     st.dataframe(hist_df.iloc[::-1].style.format({"Price": "{:.2f}"}), use_container_width=True)
                 else:
                     st.write("尚無交易紀錄")
-            else:
-                st.error("無法取得數據，請稍後再試。")
     except Exception as e:
-        st.error(f"發生錯誤: {e}")
+        st.error(f"程式執行發生錯誤: {e}")
