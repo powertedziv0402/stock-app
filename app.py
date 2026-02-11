@@ -11,8 +11,8 @@ st.title("📈 00631L 雙重濾網．全歷史績效戰情室")
 st.sidebar.header("策略邏輯 (實戰修正版)")
 st.sidebar.info("""
 **👑 優先級 1：週線抄底 (Buy B)**
-* **基準**: 使用 **「上一週」** 結算的週 K 200 均線 (避免偷看未來)。
-* **條件**: 本週任一天，盤中最低價 (Low) **碰到或跌破** 該均線。
+* **基準**: 使用 **已實現** 的週 K 200 均線。
+* **條件**: 本週任一天，盤中最低價 (Low) **碰到或跌破** 週均線。
 * **動作**: **當日觸價即買進**。
 * **價格**: 優先買在均線價 (若跳空開低則買開盤價)。
 
@@ -64,24 +64,20 @@ def get_data_and_signal():
             if 'Close' in df.columns: df[col] = df['Close']
             else: return None, None, None
 
-    # --- 2. 計算指標 (關鍵修正：移除未來函數 & 修復 NaN) ---
+    # --- 2. 計算指標 (關鍵修正：解決 NaN) ---
     # 日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
     # 週 K 200 計算
-    # 步驟 A: 算出每週五的 200 週均線
-    weekly = df['Close'].resample('W-FRI').last()
+    # 使用 'W' (每週結算)
+    weekly = df['Close'].resample('W').last()
     weekly_ma = weekly.rolling(window=200).mean()
     
-    # ★★★ 關鍵修正：Shift(1) ★★★
-    # 我們將週均線「往後移一格」。
-    # 意義：本週(Week N) 的基準線，是來自 上一週(Week N-1) 的數值。
-    # 這樣 4/8 (週二) 就會去對比 4/3 (上週五) 的均線，而不是 4/11 (本週五) 的。
-    weekly_ma_shifted = weekly_ma.shift(1)
-    
-    # 步驟 B: 將「上週的均線」填滿到「本週的每一天」
-    # 使用 ffill() 確保如果今天是週二，它能抓到上週五的值，而不是 nan
-    df['MA200_W'] = weekly_ma_shifted.reindex(df.index).ffill()
+    # ★★★ 關鍵修正：移除 shift，確保數值存在 ★★★
+    # 直接將週線數值填入日線。
+    # ffill 原理：如果是週二 (4/8)，它會往前找最近的一個週線數值 (4/4 週五)。
+    # 這樣 4/8 就能正確讀到 4/4 算出來的 MA，不會變成 nan。
+    df['MA200_W'] = weekly_ma.reindex(df.index, method='ffill')
 
     # --- 3. 策略回測 ---
     df['Action'] = None 
@@ -107,7 +103,7 @@ def get_data_and_signal():
         open_p = df['Open'].iloc[i]
         low = df['Low'].iloc[i]
         ma_d = df['MA200_D'].iloc[i]
-        ma_w = df['MA200_W'].iloc[i] # 這裡現在拿到的是"上週五"的數值，是已知數
+        ma_w = df['MA200_W'].iloc[i]
         
         if i < 2: continue
 
@@ -118,8 +114,12 @@ def get_data_and_signal():
         is_below_3days = all(days_check < ma_check)
         
         # --- 判斷觸價 ---
-        # 邏輯：今天盤中最低價 <= 上週五決定的週均線
-        is_touch_weekly = low <= (ma_w * tolerance)
+        # 如果 MA200_W 是 nan (例如剛上市前幾年)，就跳過
+        if pd.isna(ma_w):
+            is_touch_weekly = False
+        else:
+            # 邏輯：今天盤中最低價 <= 最近一次週均線
+            is_touch_weekly = low <= (ma_w * tolerance)
         
         action = None
         date_str = curr_idx.strftime('%Y-%m-%d')
@@ -130,9 +130,7 @@ def get_data_and_signal():
                 holding = True
                 action = "Buy_B"
                 
-                # 價格模擬: 
-                # 您的案例: 4/7收160, 4/8跌到142.3, 均線在152.82
-                # 程式會判定在 4/8 當天觸發買進。
+                # 價格模擬
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
@@ -286,14 +284,16 @@ if st.button('🔄 點擊更新最新數據'):
                 last_dt = df.index[-1].strftime('%Y-%m-%d')
                 last_close = df['Close'].iloc[-1]
                 last_ma_d = df['MA200_D'].iloc[-1]
-                last_ma_w = df['MA200_W'].iloc[-1]
+                
+                # 這裡處理頂部卡片的顯示，避免 nan
+                # 如果最新的週線是 nan (因為本週剛開始)，我們往前抓最近的一個有效值
+                last_ma_w = df['MA200_W'].ffill().iloc[-1]
                 
                 st.header(f"📅 數據日期: {last_dt}")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("目前股價", f"{last_close:.2f}")
                 c2.metric("日 K 200", f"{last_ma_d:.2f}")
-                # 這裡顯示的是「用來判斷本週是否買進」的週均線 (也就是上週的值)
-                c3.metric("本週抄底價 (週 K 200)", f"{last_ma_w:.2f}")
+                c3.metric("週 K 200 (抄底基準)", f"{last_ma_w:.2f}")
 
                 st.markdown("---")
 
