@@ -26,23 +26,35 @@ st.sidebar.info("""
 @st.cache_data(ttl=3600)
 def get_data_and_signal():
     ticker = "00631L.TW"
-    # 下載數據 (包含 2016 至今)
-    df = yf.download(ticker, start="2015-01-01", progress=False, auto_adjust=False)
+    
+    # --- 🔧 強化版資料抓取邏輯 ---
+    try:
+        # 改用 Ticker 物件抓取，這在 Streamlit Cloud 上通常比較穩定
+        stock = yf.Ticker(ticker)
+        # 嘗試抓取 2015 至今
+        df = stock.history(start="2015-01-01", auto_adjust=False)
+        
+        # 如果抓回來是空的 (Yahoo 偶爾會漏資料)，改抓 'max' 全部資料
+        if df.empty:
+            df = stock.history(period="max", auto_adjust=False)
+            
+    except Exception as e:
+        return None, None, None
     
     if df.empty:
         return None, None, None
 
     # --- 資料清洗 ---
     df.index = df.index.tz_localize(None) 
+    
+    # 欄位名稱標準化 (history 抓下來的欄位通常很乾淨，但以防萬一)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     
-    if 'Close' not in df.columns and 'Adj Close' in df.columns:
-        df = df.rename(columns={'Adj Close': 'Close'})
-    if 'Low' not in df.columns:
-        df['Low'] = df['Close']
-    if 'Open' not in df.columns: # 確保有 Open 用於判斷跳空
-        df['Open'] = df['Close']
+    # 確保關鍵欄位存在
+    if 'Close' not in df.columns: return None, None, None
+    if 'Low' not in df.columns: df['Low'] = df['Close']
+    if 'Open' not in df.columns: df['Open'] = df['Close']
 
     # --- 計算指標 ---
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
@@ -56,7 +68,6 @@ def get_data_and_signal():
     holding = False
     history = [] 
     
-    # 找出開始計算的點
     start_calc = 0
     for i in range(len(df)):
         if not pd.isna(df['MA200_D'].iloc[i]) and not pd.isna(df['MA200_W'].iloc[i]):
@@ -77,28 +88,23 @@ def get_data_and_signal():
         
         if i < 2: continue
 
-        # 訊號判斷變數
         days_check = df['Close'].iloc[i-2:i+1]
         ma_check = df['MA200_D'].iloc[i-2:i+1]
         
         is_above_3days = all(days_check > ma_check)
         is_below_3days = all(days_check < ma_check)
-        
-        # 關鍵修正: 只要最低價小於等於週均線，就視為觸發
         is_touch_weekly = low <= ma_w
         
         action = None
         date_str = curr_idx.strftime('%Y-%m-%d')
         
         if not holding:
-            # --- 優先級 1: 抄底 (Touch Weekly) ---
+            # 優先級 1: 抄底
             if is_touch_weekly:
                 holding = True
                 action = "Buy_B"
                 
-                # 價格計算優化:
-                # 1. 如果開盤已經跳空跌破週均線 -> 買在開盤價 (Open)
-                # 2. 如果是盤中殺下去碰到 -> 買在週均線價格 (Limit Order)
+                # 價格模擬
                 if open_p < ma_w:
                     buy_price = open_p
                     note = "跳空跌破買進"
@@ -115,8 +121,7 @@ def get_data_and_signal():
                         'Note': note
                     })
             
-            # --- 優先級 2: 順勢 (Trend) ---
-            # 只有在沒觸發抄底時，才檢查這個
+            # 優先級 2: 順勢
             elif is_above_3days:
                 holding = True
                 action = "Buy_A"
@@ -124,12 +129,11 @@ def get_data_and_signal():
                     history.append({
                         'Date': date_str, 
                         'Type': '🟢 買進(順勢)', 
-                        'Price': close, # 順勢通常以收盤確認
+                        'Price': close,
                         'RawType': 'Buy',
                         'Note': "收盤確認"
                     })
         else:
-            # 持倉中: 只檢查賣出訊號
             if is_below_3days:
                 holding = False
                 action = "Sell"
@@ -178,7 +182,6 @@ def process_performance_table(history, is_holding):
     if not df_trades.empty:
         df_trades = df_trades[::-1]
 
-    # 第一格狀態
     current_status = {}
     if is_holding and temp_buy is not None:
         current_status = {
@@ -257,6 +260,7 @@ if st.button('🔄 點擊更新最新數據'):
                 
                 with col_table:
                     st.subheader("📋 交易績效總覽 (含優先級修正)")
+                    # 關鍵：隱藏 index 與 is_active 欄位
                     styled_table = style_dataframe(df_display).hide(axis='index').hide(subset=['is_active'], axis="columns")
                     st.dataframe(
                         styled_table, 
@@ -275,9 +279,9 @@ if st.button('🔄 點擊更新最新數據'):
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA200_D'], mode='lines', name='日K200', line=dict(color='#FF6D00', width=1)))
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA200_W'], mode='lines', name='週K200', line=dict(color='#D50000', width=2, dash='dash')))
                     
-                    # 分開繪製兩種買進訊號
-                    buys_b = df[df['Action'] == 'Buy_B'] # 抄底
-                    buys_a = df[df['Action'] == 'Buy_A'] # 順勢
+                    # 繪製買賣點
+                    buys_b = df[df['Action'] == 'Buy_B'] 
+                    buys_a = df[df['Action'] == 'Buy_A'] 
                     sells = df[df['Action'] == 'Sell']
                     
                     fig.add_trace(go.Scatter(x=buys_b.index, y=buys_b['Low'], mode='markers', name='買進(抄底)', marker=dict(color='purple', size=15, symbol='star')))
@@ -289,6 +293,6 @@ if st.button('🔄 點擊更新最新數據'):
                     st.plotly_chart(fig, use_container_width=True)
 
             else:
-                st.error("無法取得數據，請稍後再試。")
+                st.error("Yahoo Finance 暫時無回應，請稍後再試 (或重新整理網頁)。")
     except Exception as e:
         st.error(f"發生錯誤: {e}")
