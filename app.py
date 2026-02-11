@@ -112,7 +112,7 @@ def get_data_and_signal():
     df['Action'] = signals
     return df, history, holding
 
-# --- 處理績效表格的函數 (關鍵修改) ---
+# --- 處理績效表格的函數 ---
 def process_performance_table(history, is_holding):
     trades = []
     
@@ -247,8 +247,8 @@ if st.button('🔄 點擊更新最新數據'):
                 with col_table:
                     st.subheader("📋 交易績效總覽 (2016-2026)")
                     
-                    # 應用樣式並隱藏輔助欄位
-                    styled_table = style_dataframe(df_display).hide(axis='index').hide(subset=['is_active'])
+                    # 應用樣式並隱藏輔助欄位 (關鍵修正: 指定 axis='columns')
+                    styled_table = style_dataframe(df_display).hide(axis='index').hide(subset=['is_active'], axis="columns")
                     
                     # 顯示表格 (height 設定高一點讓它可捲動)
                     st.dataframe(
