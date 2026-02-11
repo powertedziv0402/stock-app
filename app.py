@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
+import time
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="00631L 策略戰情室", layout="wide")
@@ -23,40 +24,70 @@ st.sidebar.info("""
 * **條件**: 連續 3 日收盤 < 日 K 200 均線
 """)
 
+# --- 🔧 強化版資料抓取函數 (雙重備援) ---
+def fetch_data_robust(ticker):
+    # 方法 1: 使用 Ticker.history (通常較快)
+    try:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="max", auto_adjust=False)
+        if not df.empty:
+            return df
+    except Exception:
+        pass # 失敗就默默換下一個方法
+    
+    # 方法 2: 使用 download (傳統方法，有時候較穩)
+    try:
+        df = yf.download(ticker, period="max", progress=False, auto_adjust=False)
+        if not df.empty:
+            return df
+    except Exception:
+        pass
+        
+    return None
+
 # --- 核心邏輯函數 ---
 @st.cache_data(ttl=3600)
 def get_data_and_signal():
     ticker = "00631L.TW"
     
-    # 1. 抓取數據
-    try:
-        stock = yf.Ticker(ticker)
-        # 抓取最大範圍以確保均線計算完整
-        df = stock.history(period="max", auto_adjust=False)
-    except:
-        return None, None, None
+    # 使用強化版抓取
+    df = fetch_data_robust(ticker)
     
-    if df.empty: return None, None, None
+    if df is None or df.empty:
+        return None, None, None
 
     # 2. 資料清洗
     df.index = df.index.tz_localize(None) 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
     
-    # 欄位檢查
-    for col in ['Close', 'Low', 'Open']:
-        if col not in df.columns: return None, None, None
+    # 處理多層欄位 (相容不同版本的 yfinance)
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            # 嘗試提取 'Price' 層級
+            df.columns = df.columns.get_level_values(0)
+        except:
+            pass
+            
+    # 再次確認欄位名稱 (有時候會是 Adj Close)
+    if 'Close' not in df.columns and 'Adj Close' in df.columns:
+        df = df.rename(columns={'Adj Close': 'Close'})
+        
+    # 確保必要欄位存在
+    required_cols = ['Close', 'Low', 'Open']
+    for col in required_cols:
+        if col not in df.columns:
+            # 如果真的缺資料，嘗試用 Close 填補
+            if 'Close' in df.columns:
+                df[col] = df['Close']
+            else:
+                return None, None, None
 
     # 3. 計算指標
     # 日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
     # 週 K 200 (計算修正)
-    # 邏輯：週線均線是根據每週收盤算出來的，我們將其擴展回日線
     weekly = df['Close'].resample('W').last()
     weekly_ma = weekly.rolling(window=200).mean()
-    
-    # 使用 ffill 將上週的均線值延續到本週 (模擬支撐線概念)
     df['MA200_W'] = weekly_ma.reindex(df.index, method='ffill')
 
     # 4. 策略回測
@@ -64,9 +95,9 @@ def get_data_and_signal():
     holding = False
     history = [] 
     
-    # 寬容度微調 (防止數據微小誤差)
-    tolerance = 1.005 
+    tolerance = 1.005 # 寬容度 0.5%
     
+    # 找出起始點
     start_calc = 0
     for i in range(len(df)):
         if not pd.isna(df['MA200_D'].iloc[i]) and not pd.isna(df['MA200_W'].iloc[i]):
@@ -95,7 +126,6 @@ def get_data_and_signal():
         is_below_3days = all(days_check < ma_check)
         
         # --- 核心修改：觸價判定 ---
-        # 不看收盤，只看最低價是否摸到均線 (含寬容度)
         is_touch_weekly = low <= (ma_w * tolerance)
         
         action = None
@@ -107,10 +137,7 @@ def get_data_and_signal():
                 holding = True
                 action = "Buy_B"
                 
-                # --- 價格邏輯修改 ---
-                # 您的要求：買在週均線價格
-                # 實戰防呆：如果開盤就跳空跌破均線 (Open < MA)，那只能買在 Open (會比 MA 更便宜)
-                # 如果開盤在 MA 之上，盤中殺下來，那就買在 MA (掛單成交)
+                # 價格邏輯: 買在均線價 (除非跳空)
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
@@ -135,7 +162,7 @@ def get_data_and_signal():
                     history.append({
                         'Date': date_str, 
                         'Type': '🟢 優先 2：日線順勢', 
-                        'Price': close, # 順勢單通常等收盤確認
+                        'Price': close,
                         'RawType': 'Buy',
                         'Note': "收盤確認"
                     })
@@ -251,6 +278,12 @@ def style_dataframe(df):
     return styler
 
 # --- 主程式 ---
+
+# 增加一個清除快取的按鈕，防止連線卡死
+if st.sidebar.button("🗑️ 清除快取 (連線錯誤時請按我)"):
+    st.cache_data.clear()
+    st.rerun()
+
 if st.button('🔄 點擊更新最新數據'):
     try:
         with st.spinner('正在連線 Yahoo Finance 抓取最新股價...'):
@@ -303,6 +336,6 @@ if st.button('🔄 點擊更新最新數據'):
                     st.plotly_chart(fig, use_container_width=True)
 
             else:
-                st.error("Yahoo Finance 暫時無回應，請稍後再試。")
+                st.error("⚠️ 兩次嘗試連線都失敗，Yahoo 暫時阻擋了連線。請按左側邊欄的「🗑️ 清除快取」後再試一次，或是等待 5 分鐘後再刷新。")
     except Exception as e:
         st.error(f"發生錯誤: {e}")
