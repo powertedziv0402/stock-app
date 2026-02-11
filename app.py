@@ -8,12 +8,13 @@ st.set_page_config(page_title="00631L 策略戰情室", layout="wide")
 st.title("📈 00631L 雙重濾網．全歷史績效戰情室")
 
 # --- 側邊欄說明 ---
-st.sidebar.header("策略邏輯 (盤中觸價即買)")
+st.sidebar.header("策略邏輯 (實戰修正版)")
 st.sidebar.info("""
 **👑 優先級 1：週線抄底 (Buy B)**
-* **條件**: 只要盤中最低價 (Low) **碰到或跌破** 週 K 200 均線。
-* **動作**: **掛單買進**。
-* **價格**: 以 **週 K 200 均線價格** 成交 (若跳空跌破則以開盤價成交)。
+* **基準**: 使用 **「上一週」** 結算的週 K 200 均線 (避免偷看未來)。
+* **條件**: 本週任一天，盤中最低價 (Low) **碰到或跌破** 該均線。
+* **動作**: **當日觸價即買進**。
+* **價格**: 優先買在均線價 (若跳空開低則買開盤價)。
 
 **🟢 優先級 2：日線順勢 (Buy A)**
 * **條件**: 連續 3 日收盤 > 日 K 200 均線
@@ -25,22 +26,16 @@ st.sidebar.info("""
 
 # --- 🔧 強化版資料抓取函數 ---
 def fetch_data_robust(ticker):
-    # 方法 1: 使用 Ticker.history (通常較快且穩定)
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="max", auto_adjust=False)
-        if not df.empty:
-            return df
-    except Exception:
-        pass 
+        if not df.empty: return df
+    except: pass
     
-    # 方法 2: 使用 download
     try:
         df = yf.download(ticker, period="max", progress=False, auto_adjust=False)
-        if not df.empty:
-            return df
-    except Exception:
-        pass
+        if not df.empty: return df
+    except: pass
         
     return None
 
@@ -54,50 +49,49 @@ def get_data_and_signal():
     if df is None or df.empty:
         return None, None, None
 
-    # --- 1. 資料清洗與時區移除 (關鍵步驟) ---
-    # 必須先移除時區，否則後續 Resample 會出錯導致 NaN
-    df.index = df.index.tz_localize(None) 
+    # --- 1. 資料清洗 ---
+    df.index = df.index.tz_localize(None).normalize()
     
-    # 處理多層欄位
     if isinstance(df.columns, pd.MultiIndex):
-        try:
-            df.columns = df.columns.get_level_values(0)
+        try: df.columns = df.columns.get_level_values(0)
         except: pass
             
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
         df = df.rename(columns={'Adj Close': 'Close'})
         
-    required_cols = ['Close', 'Low', 'Open']
-    for col in required_cols:
+    for col in ['Close', 'Low', 'Open']:
         if col not in df.columns:
             if 'Close' in df.columns: df[col] = df['Close']
             else: return None, None, None
 
-    # --- 2. 計算指標 (修復 NaN 問題) ---
+    # --- 2. 計算指標 (關鍵修正：移除未來函數) ---
     # 日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
-    # 週 K 200 (強力修復版)
-    # 使用 'W-FRI' 確保每週五結算，對齊台股習慣
+    # 週 K 200 計算
+    # 步驟 A: 算出每週五的 200 週均線
     weekly = df['Close'].resample('W-FRI').last()
     weekly_ma = weekly.rolling(window=200).mean()
     
-    # 將週線數據合併回日線
-    # 關鍵修正：reindex 後使用 ffill (向前填補) 
-    # 這確保了「本週」尚未結束時，會沿用「上週」的均線數值，避免出現 NaN
-    df['MA200_W'] = weekly_ma.reindex(df.index).ffill()
+    # ★★★ 關鍵修正：Shift(1) ★★★
+    # 我們將週均線「往後移一格」。
+    # 意義：本週(Week N) 的基準線，是來自 上一週(Week N-1) 的數值。
+    # 這樣 4/8 (週二) 就會去對比 4/3 (上週五) 的均線，而不是 4/11 (本週五) 的。
+    weekly_ma_shifted = weekly_ma.shift(1)
+    
+    # 步驟 B: 將「上週的均線」填滿到「本週的每一天」
+    df['MA200_W'] = weekly_ma_shifted.reindex(df.index, method='ffill')
 
     # --- 3. 策略回測 ---
     df['Action'] = None 
     holding = False
     history = [] 
     
-    # 寬容度設定：1% (解決 Yahoo 數據與看盤軟體的微小誤差)
+    # 寬容度 (稍微放寬一點點，避免數據誤差)
     tolerance = 1.01 
     
     start_calc = 0
     for i in range(len(df)):
-        # 確保兩個指標都有值才開始算
         if not pd.isna(df['MA200_D'].iloc[i]) and not pd.isna(df['MA200_W'].iloc[i]):
             start_calc = i
             break
@@ -112,7 +106,7 @@ def get_data_and_signal():
         open_p = df['Open'].iloc[i]
         low = df['Low'].iloc[i]
         ma_d = df['MA200_D'].iloc[i]
-        ma_w = df['MA200_W'].iloc[i]
+        ma_w = df['MA200_W'].iloc[i] # 這裡現在拿到的是"上週五"的數值，是已知數
         
         if i < 2: continue
 
@@ -122,26 +116,29 @@ def get_data_and_signal():
         is_above_3days = all(days_check > ma_check)
         is_below_3days = all(days_check < ma_check)
         
-        # --- 核心判定：觸價 (含寬容度) ---
-        # 只要最低價 <= 週均線 * 1.01，就視為摸到
+        # --- 判斷觸價 ---
+        # 邏輯：今天盤中最低價 <= 上週五決定的週均線
         is_touch_weekly = low <= (ma_w * tolerance)
         
         action = None
         date_str = curr_idx.strftime('%Y-%m-%d')
         
         if not holding:
-            # === 優先級 1: 週線抄底 (絕對優先) ===
+            # === 優先級 1: 週線抄底 ===
             if is_touch_weekly:
                 holding = True
                 action = "Buy_B"
                 
-                # 價格邏輯
+                # 價格模擬: 
+                # 您的案例: 4/7收160, 4/8跌到142.3, 均線在152.82
+                # 4/8 當天開盤可能在 158 (假設)，盤中殺到 142.3
+                # 程式會在價格穿過 152.82 時成交。
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
                 else:
                     buy_price = ma_w
-                    note_text = "觸價成交 (買MA)"
+                    note_text = "觸價掛單 (買MA)"
 
                 if is_in_range:
                     history.append({
@@ -165,7 +162,7 @@ def get_data_and_signal():
                         'Note': "收盤確認"
                     })
         else:
-            # 持倉中: 只能賣出
+            # 持倉中: 檢查賣出
             if is_below_3days:
                 holding = False
                 action = "Sell"
@@ -276,7 +273,7 @@ def style_dataframe(df):
     return styler
 
 # --- 主程式 ---
-if st.sidebar.button("🗑️ 清除快取 (連線錯誤時請按我)"):
+if st.sidebar.button("🗑️ 清除快取 (數據異常請按我)"):
     st.cache_data.clear()
     st.rerun()
 
@@ -289,14 +286,14 @@ if st.button('🔄 點擊更新最新數據'):
                 last_dt = df.index[-1].strftime('%Y-%m-%d')
                 last_close = df['Close'].iloc[-1]
                 last_ma_d = df['MA200_D'].iloc[-1]
-                # 這裡也要用 ffill 確保 header 顯示正常
-                last_ma_w = df['MA200_W'].ffill().iloc[-1] 
+                last_ma_w = df['MA200_W'].iloc[-1]
                 
                 st.header(f"📅 數據日期: {last_dt}")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("目前股價", f"{last_close:.2f}")
                 c2.metric("日 K 200", f"{last_ma_d:.2f}")
-                c3.metric("週 K 200", f"{last_ma_w:.2f}")
+                # 這裡顯示的是「用來判斷本週是否買進」的週均線 (也就是上週的值)
+                c3.metric("本週抄底價 (週 K 200)", f"{last_ma_w:.2f}")
 
                 st.markdown("---")
 
@@ -305,7 +302,7 @@ if st.button('🔄 點擊更新最新數據'):
                 col_table, col_chart = st.columns([5, 4])
                 
                 with col_table:
-                    st.subheader("📋 交易績效總覽 (含週線修正)")
+                    st.subheader("📋 交易績效總覽 (實戰邏輯)")
                     styled_table = style_dataframe(df_display).hide(axis='index').hide(subset=['is_active'], axis="columns")
                     st.dataframe(
                         styled_table, 
@@ -318,7 +315,7 @@ if st.button('🔄 點擊更新最新數據'):
                     fig = go.Figure()
                     fig.add_trace(go.Scatter(x=df.index, y=df['Close'], mode='lines', name='收盤價', line=dict(color='#2962FF', width=1)))
                     fig.add_trace(go.Scatter(x=df.index, y=df['MA200_D'], mode='lines', name='日K200', line=dict(color='#FF6D00', width=1)))
-                    fig.add_trace(go.Scatter(x=df.index, y=df['MA200_W'], mode='lines', name='週K200', line=dict(color='#D50000', width=2, dash='dash')))
+                    fig.add_trace(go.Scatter(x=df.index, y=df['MA200_W'], mode='lines', name='週K200 (基準)', line=dict(color='#D50000', width=2, dash='dash')))
                     
                     buys_b = df[df['Action'] == 'Buy_B'] 
                     buys_a = df[df['Action'] == 'Buy_A'] 
