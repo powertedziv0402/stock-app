@@ -2,7 +2,6 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
-import time
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="00631L 策略戰情室", layout="wide")
@@ -24,18 +23,18 @@ st.sidebar.info("""
 * **條件**: 連續 3 日收盤 < 日 K 200 均線
 """)
 
-# --- 🔧 強化版資料抓取函數 (雙重備援) ---
+# --- 🔧 強化版資料抓取函數 ---
 def fetch_data_robust(ticker):
-    # 方法 1: 使用 Ticker.history (通常較快)
+    # 方法 1: 使用 Ticker.history (通常較快且穩定)
     try:
         stock = yf.Ticker(ticker)
         df = stock.history(period="max", auto_adjust=False)
         if not df.empty:
             return df
     except Exception:
-        pass # 失敗就默默換下一個方法
+        pass 
     
-    # 方法 2: 使用 download (傳統方法，有時候較穩)
+    # 方法 2: 使用 download
     try:
         df = yf.download(ticker, period="max", progress=False, auto_adjust=False)
         if not df.empty:
@@ -50,56 +49,55 @@ def fetch_data_robust(ticker):
 def get_data_and_signal():
     ticker = "00631L.TW"
     
-    # 使用強化版抓取
     df = fetch_data_robust(ticker)
     
     if df is None or df.empty:
         return None, None, None
 
-    # 2. 資料清洗
+    # --- 1. 資料清洗與時區移除 (關鍵步驟) ---
+    # 必須先移除時區，否則後續 Resample 會出錯導致 NaN
     df.index = df.index.tz_localize(None) 
     
-    # 處理多層欄位 (相容不同版本的 yfinance)
+    # 處理多層欄位
     if isinstance(df.columns, pd.MultiIndex):
         try:
-            # 嘗試提取 'Price' 層級
             df.columns = df.columns.get_level_values(0)
-        except:
-            pass
+        except: pass
             
-    # 再次確認欄位名稱 (有時候會是 Adj Close)
     if 'Close' not in df.columns and 'Adj Close' in df.columns:
         df = df.rename(columns={'Adj Close': 'Close'})
         
-    # 確保必要欄位存在
     required_cols = ['Close', 'Low', 'Open']
     for col in required_cols:
         if col not in df.columns:
-            # 如果真的缺資料，嘗試用 Close 填補
-            if 'Close' in df.columns:
-                df[col] = df['Close']
-            else:
-                return None, None, None
+            if 'Close' in df.columns: df[col] = df['Close']
+            else: return None, None, None
 
-    # 3. 計算指標
+    # --- 2. 計算指標 (修復 NaN 問題) ---
     # 日 K 200
     df['MA200_D'] = df['Close'].rolling(window=200).mean()
     
-    # 週 K 200 (計算修正)
-    weekly = df['Close'].resample('W').last()
+    # 週 K 200 (強力修復版)
+    # 使用 'W-FRI' 確保每週五結算，對齊台股習慣
+    weekly = df['Close'].resample('W-FRI').last()
     weekly_ma = weekly.rolling(window=200).mean()
-    df['MA200_W'] = weekly_ma.reindex(df.index, method='ffill')
+    
+    # 將週線數據合併回日線
+    # 關鍵修正：reindex 後使用 ffill (向前填補) 
+    # 這確保了「本週」尚未結束時，會沿用「上週」的均線數值，避免出現 NaN
+    df['MA200_W'] = weekly_ma.reindex(df.index).ffill()
 
-    # 4. 策略回測
+    # --- 3. 策略回測 ---
     df['Action'] = None 
     holding = False
     history = [] 
     
-    tolerance = 1.005 # 寬容度 0.5%
+    # 寬容度設定：1% (解決 Yahoo 數據與看盤軟體的微小誤差)
+    tolerance = 1.01 
     
-    # 找出起始點
     start_calc = 0
     for i in range(len(df)):
+        # 確保兩個指標都有值才開始算
         if not pd.isna(df['MA200_D'].iloc[i]) and not pd.isna(df['MA200_W'].iloc[i]):
             start_calc = i
             break
@@ -118,14 +116,14 @@ def get_data_and_signal():
         
         if i < 2: continue
 
-        # 訊號判定
         days_check = df['Close'].iloc[i-2:i+1]
         ma_check = df['MA200_D'].iloc[i-2:i+1]
         
         is_above_3days = all(days_check > ma_check)
         is_below_3days = all(days_check < ma_check)
         
-        # --- 核心修改：觸價判定 ---
+        # --- 核心判定：觸價 (含寬容度) ---
+        # 只要最低價 <= 週均線 * 1.01，就視為摸到
         is_touch_weekly = low <= (ma_w * tolerance)
         
         action = None
@@ -137,7 +135,7 @@ def get_data_and_signal():
                 holding = True
                 action = "Buy_B"
                 
-                # 價格邏輯: 買在均線價 (除非跳空)
+                # 價格邏輯
                 if open_p < ma_w:
                     buy_price = open_p
                     note_text = "跳空跌破 (買Open)"
@@ -278,8 +276,6 @@ def style_dataframe(df):
     return styler
 
 # --- 主程式 ---
-
-# 增加一個清除快取的按鈕，防止連線卡死
 if st.sidebar.button("🗑️ 清除快取 (連線錯誤時請按我)"):
     st.cache_data.clear()
     st.rerun()
@@ -293,7 +289,8 @@ if st.button('🔄 點擊更新最新數據'):
                 last_dt = df.index[-1].strftime('%Y-%m-%d')
                 last_close = df['Close'].iloc[-1]
                 last_ma_d = df['MA200_D'].iloc[-1]
-                last_ma_w = df['MA200_W'].iloc[-1]
+                # 這裡也要用 ffill 確保 header 顯示正常
+                last_ma_w = df['MA200_W'].ffill().iloc[-1] 
                 
                 st.header(f"📅 數據日期: {last_dt}")
                 c1, c2, c3 = st.columns(3)
@@ -308,7 +305,7 @@ if st.button('🔄 點擊更新最新數據'):
                 col_table, col_chart = st.columns([5, 4])
                 
                 with col_table:
-                    st.subheader("📋 交易績效總覽 (盤中觸價買入)")
+                    st.subheader("📋 交易績效總覽 (含週線修正)")
                     styled_table = style_dataframe(df_display).hide(axis='index').hide(subset=['is_active'], axis="columns")
                     st.dataframe(
                         styled_table, 
@@ -336,6 +333,6 @@ if st.button('🔄 點擊更新最新數據'):
                     st.plotly_chart(fig, use_container_width=True)
 
             else:
-                st.error("⚠️ 兩次嘗試連線都失敗，Yahoo 暫時阻擋了連線。請按左側邊欄的「🗑️ 清除快取」後再試一次，或是等待 5 分鐘後再刷新。")
+                st.error("Yahoo Finance 暫時無回應，請稍後再試。")
     except Exception as e:
         st.error(f"發生錯誤: {e}")
